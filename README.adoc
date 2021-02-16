@@ -26,7 +26,7 @@ If you are here then I expect you to have at least a basic understanding of the 
 If not, then let me be the first one to tell you that you have reached the end of the internet and it is probably time you go to bed.
 You are reading about a system setup that probably only .000000001% of all computer users use, but they happen to the smart users and I plan to follow in their footsteps and leave a trail of breadcrumbs behind.
 
-As for myself, I see many benefits of functional progamming and in general removing the amount of "inplace" changes, or mutation, in all levels of my technology stack. 
+As for myself, I see many benefits of functional progamming and in general removing the amount of "inplace" changes, or mutation, in all levels of my technology stack.
 I have moved from using a traditional Linux system to Nixos, from Python to Clojure, plan to use a database like Datomic instead of traditional mutating DBs such as Postgres, and I see the filesystem as just another step in this evolution.
 
 === Why did I create this guide?
@@ -410,23 +410,35 @@ We will have a home data set that we will snapshot and a nixos dataset that we w
 |No
 |===
 
-==== Create the ZFS Encrypted Pool
-This is going to be a single disk on our laptop and it will use encryption.
+==== Create the ZFS Pool
+This is going to be a single disk.
 *Note the "-O" is the letter O not zero.*
 
-[INFORMATION]
-.command : Create the encrypted zpool on disk partition  1
-----
-zpool create -o ashift=12 -o altroot="/mnt" -O mountpoint=none -O encryption=aes-256-gcm -O keyformat=passphrase rpool $ZFS
-----
+# Disable writing access time:
+#   -O atime=off
+#
+# Use 4K sectors on the drive, otherwise you can get really
+# bad performance:
+#   -o ashift=12
+#
+# This is more or less required for certain things to
+# not break:
+#   -O acltype=posixacl
+#
+# To improve performance of certain extended attributes:
+#   -O xattr=sa
+#
+# To enable file system compression:
+#   -O compression=lz4
+#
+# To enable encryption:
+#   -O encryption=aes-256-gcm -O keyformat=passphrase
 
-It will then ask for you to create a passphrase:
 
 [INFORMATION]
-.information : Enter ZFS password to unencrpt at boot.
+.command : Create the zpool on disk partition  1
 ----
-Enter passphrase:
-Re-enter passphrase:
+zpool create -o ashift=12 -o altroot="/mnt" -O mountpoint=none -O compression=lz4 rpool $ZFS
 ----
 
 ==== Create the ZFS Data Sets
@@ -437,23 +449,21 @@ Note that the home pool will have automatic snapshots turned on.
 [INFORMATION]
 .command : create zfs structure and data pools, each line is a command.
 ----
-zfs create -o mountpoint=none rpool/root //<1>
 
-zfs create -o mountpoint=legacy rpool/root/nixos //<2>
+zfs create -p -o mountpoint=legacy rpool/local/root
 
-zfs create -o mountpoint=legacy -o com.sun:auto-snapshot=true rpool/home //<3>
+zfs snapshot rpool/local/root@blank
 
-zfs set compression=lz4 rpool/home //<4>
+zfs create -p -o mountpoint=legacy -o dedup=on rpool/local/nix
+
+zfs create -p -o mountpoint=legacy -o com.sun:auto-snapshot=true rpool/safe/home
+
+zfs create -p -o mountpoint=legacy rpool/safe/persist
+
+zfs create -p -o mountpoint=legacy rpool/safe/persist/nixos
 
 ----
 
-
-
-<1> Creating the root directory within zpool
-<2> Creating the nixos data pool.
-<3> The home data pool is going to get automatic snapshots.
-<4> We will use compression on the home folder to cut down on the size.
-The ZFS literature says that the performance impact is minimal for the benefits.
 
 === Mount filesystems
 
@@ -465,13 +475,22 @@ We are going to mount each of the filesystems.
 [INFORMATION]
 .command : mount the zfs data pools.  Each line is a command.
 ----
-mount -t zfs rpool/root/nixos /mnt //<1>
+mount -t zfs rpool/local/root /mnt
 
-mkdir /mnt/home    //<2>
-mount -t zfs rpool/home /mnt/home
+mkdir -p /mnt/nix
+mount -t zfs rpool/local/nix /mnt/nix
+
+mkdir -p /mnt/home
+mount -t zfs rpool/safe/home /mnt/home
+
+mkdir -p /mnt/persist
+mount -t zfs rpool/safe/persist /mnt/persist
+
+mkdir -p /mnt/etc/nixos
+mount -t zfs rpool/safe/persist/nixos /mnt/etc/nixos
+
 ----
-<1> root
-<2> home
+
 
 ==== Mount Boot partition
 Now we need to setup our boot EFI as a non-ZFS partition.
@@ -604,6 +623,12 @@ nano /mnt/etc/nixos/configuration.nix
 Below is my configuration.nix file after making the edits.
 Please review each of the callouts and add them to your file.
 
+
+
+# mkdir -p /mnt/persist/var/lib/bluetooth
+# mkdir -p /mnt/persist/etc/ssh
+
+
 [INFORMATION]
 .Edit: configuration.nix contents
 [source, nix]
@@ -612,7 +637,7 @@ Please review each of the callouts and add them to your file.
 # your system.  Help is available in the configuration.nix(5) man page
 # and in the NixOS manual (accessible by running ‘nixos-help’).
 
-{ config, pkgs, ... }:
+{ config, pkgs, lib, ... }:
 
 {
   imports =
@@ -625,7 +650,10 @@ Please review each of the callouts and add them to your file.
   boot.loader.efi.canTouchEfiVariables = true;
   # Add ZFS support.
   boot.supportedFilesystems = ["zfs"]; //<1>
-  boot.zfs.requestEncryptionCredentials = true; //<2>
+  # boot.zfs.requestEncryptionCredentials = true; //<2>
+  boot.initrd.postDeviceCommands = lib.mkAfter ''
+    zfs rollback -r rpool/local/root@blank
+  '';
 
   networking.hostId = "238330f5"; //<3>
   # networking.hostName = "nixos"; # Define your hostname.
@@ -700,6 +728,11 @@ Please review each of the callouts and add them to your file.
   # servers. You should change this only after NixOS release notes say you
   # should.
   system.stateVersion = "19.09"; # Did you read the comment?
+
+  # persist bluetooth connections
+  systemd.tmpfiles.rules = [
+    "L /var/lib/bluetooth - - - - /persist/var/lib/bluetooth"
+  ];
 }
 ----
 <1> Enable ZFS
